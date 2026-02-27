@@ -13,21 +13,40 @@ import { getChannelMessageService } from '../agent/ChannelMessageService';
 import { getChannelManager } from '../core/ChannelManager';
 import type { AgentDisplayInfo } from '../plugins/telegram/TelegramKeyboards';
 import { createAgentSelectionKeyboard, createHelpKeyboard, createMainMenuKeyboard, createSessionControlKeyboard } from '../plugins/telegram/TelegramKeyboards';
+import { getChannelConversationName, resolveChannelConvType } from '../types';
 import { createAgentSelectionCard, createFeaturesCard, createHelpCard, createMainMenuCard, createPairingGuideCard, createSessionStatusCard, createSettingsCard, createTipsCard } from '../plugins/lark/LarkCards';
-import type { ChannelAgentType } from '../types';
+import { createAgentSelectionCard as createDingTalkAgentSelectionCard, createFeaturesCard as createDingTalkFeaturesCard, createHelpCard as createDingTalkHelpCard, createMainMenuCard as createDingTalkMainMenuCard, createPairingGuideCard as createDingTalkPairingGuideCard, createSessionStatusCard as createDingTalkSessionStatusCard, createSettingsCard as createDingTalkSettingsCard, createTipsCard as createDingTalkTipsCard } from '../plugins/dingtalk/DingTalkCards';
+import type { ChannelAgentType, PluginType } from '../types';
 import type { ActionHandler, IRegisteredAction } from './types';
 import { SystemActionNames, createErrorResponse, createSuccessResponse } from './types';
+import { GOOGLE_AUTH_PROVIDER_ID } from '@/common/constants';
+import type { AcpBackend } from '@/types/acpTypes';
 
 /**
- * Get the default model for Telegram assistant
+ * Get the default model for Channel assistant (Telegram/Lark)
  * Reads from saved config or falls back to default Gemini model
  */
-export async function getTelegramDefaultModel(): Promise<TProviderWithModel> {
+
+export async function getChannelDefaultModel(platform: PluginType): Promise<TProviderWithModel> {
   try {
     // Try to get saved model selection
-    const savedModel = await ProcessConfig.get('assistant.telegram.defaultModel');
+    const savedModel = platform === 'lark' ? await ProcessConfig.get('assistant.lark.defaultModel') : platform === 'dingtalk' ? await ProcessConfig.get('assistant.dingtalk.defaultModel') : await ProcessConfig.get('assistant.telegram.defaultModel');
     if (savedModel?.id && savedModel?.useModel) {
-      // Get full provider config from model.config
+      // Google Auth provider is a frontend-only virtual provider — it has no
+      // entry in model.config. For Google Auth, return a minimal config that
+      // lets the Gemini CLI use the selected model via Google authentication.
+      if (savedModel.id === GOOGLE_AUTH_PROVIDER_ID) {
+        return {
+          id: GOOGLE_AUTH_PROVIDER_ID,
+          platform: 'gemini-with-google-auth',
+          name: 'Gemini Google Auth',
+          baseUrl: '',
+          apiKey: '',
+          useModel: savedModel.useModel,
+        } as TProviderWithModel;
+      }
+
+      // For regular (API-key-based) providers, look up full config
       const providers = await ProcessConfig.get('model.config');
       if (providers && Array.isArray(providers)) {
         const provider = providers.find((p) => p.id === savedModel.id);
@@ -60,7 +79,7 @@ export async function getTelegramDefaultModel(): Promise<TProviderWithModel> {
     id: 'gemini_default',
     platform: 'gemini',
     name: 'Gemini',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    baseUrl: 'https://generativelanguage.googleapis.com',
     apiKey: '',
     useModel: 'gemini-2.0-flash',
   };
@@ -88,47 +107,93 @@ export const handleSessionNew: ActionHandler = async (context) => {
     return createErrorResponse('User not authorized');
   }
 
-  // Clear existing session and agent for this user
-  // 清除现有会话和 agent
-  const existingSession = sessionManager.getSession(context.channelUser.id);
+  // Clear existing session and agent for this user+chat
+  const existingSession = sessionManager.getSession(context.channelUser.id, context.chatId);
   if (existingSession) {
-    // 清除 ChannelMessageService 中的 agent 缓存
+    // Clear agent cache in ChannelMessageService
     const messageService = getChannelMessageService();
     await messageService.clearContext(existingSession.id);
 
-    // 直接使用 session.conversationId 清理 WorkerManage 中的 agent
-    // 确保即使 sessionConversationMap 为空也能正确清理
+    // Kill the worker for the old conversation
     if (existingSession.conversationId) {
       try {
         WorkerManage.kill(existingSession.conversationId);
-        console.log(`[SystemActions] Killed old conversation: ${existingSession.conversationId}`);
       } catch (err) {
         console.warn(`[SystemActions] Failed to kill old conversation:`, err);
       }
     }
   }
-  sessionManager.clearSession(context.channelUser.id);
+  sessionManager.clearSession(context.channelUser.id, context.chatId);
 
-  // 获取用户选择的模型 / Get user selected model
-  const model = await getTelegramDefaultModel();
+  const platform = context.platform;
+  const source = platform === 'lark' ? 'lark' : platform === 'dingtalk' ? 'dingtalk' : 'telegram';
 
-  // 使用 ConversationService 创建新会话（始终创建新的，不复用）
-  // Use ConversationService to create new conversation (always new, don't reuse)
-  const result = await ConversationService.createGeminiConversation({
-    model,
-    source: 'telegram',
-    name: 'Telegram Assistant',
-  });
+  // Selected agent (defaults to Gemini)
+  let savedAgent: unknown = undefined;
+  try {
+    savedAgent = await (platform === 'lark' ? ProcessConfig.get('assistant.lark.agent') : platform === 'dingtalk' ? ProcessConfig.get('assistant.dingtalk.agent') : ProcessConfig.get('assistant.telegram.agent'));
+  } catch {
+    // ignore
+  }
+  const backend = (savedAgent && typeof savedAgent === 'object' && typeof (savedAgent as any).backend === 'string' ? (savedAgent as any).backend : 'gemini') as string;
+  const customAgentId = savedAgent && typeof savedAgent === 'object' ? ((savedAgent as any).customAgentId as string | undefined) : undefined;
+  const agentName = savedAgent && typeof savedAgent === 'object' ? ((savedAgent as any).name as string | undefined) : undefined;
+
+  // Provider model is required by typing; ACP/Codex will ignore it.
+  const model = await getChannelDefaultModel(platform);
+
+  // Always create a NEW conversation for "session.new" (scoped by chatId)
+  const channelChatId = context.chatId;
+  const { convType, convBackend } = resolveChannelConvType(backend);
+  const name = getChannelConversationName(platform, convType, convBackend, channelChatId);
+  const result =
+    backend === 'codex'
+      ? await ConversationService.createConversation({
+          type: 'codex',
+          model,
+          source,
+          name,
+          channelChatId,
+          extra: {},
+        })
+      : backend === 'gemini'
+        ? await ConversationService.createGeminiConversation({
+            model,
+            source,
+            name,
+            channelChatId,
+          })
+        : backend === 'openclaw-gateway'
+          ? await ConversationService.createConversation({
+              type: 'openclaw-gateway',
+              model,
+              source,
+              name,
+              channelChatId,
+              extra: {},
+            })
+          : await ConversationService.createConversation({
+              type: 'acp',
+              model,
+              source,
+              name,
+              channelChatId,
+              extra: {
+                backend: backend as AcpBackend,
+                customAgentId,
+                agentName,
+              },
+            });
 
   if (!result.success || !result.conversation) {
     return createErrorResponse(`Failed to create session: ${result.error || 'Unknown error'}`);
   }
 
-  // Create session with the new conversation ID
-  // 使用新会话 ID 创建 session
-  const session = sessionManager.createSessionWithConversation(context.channelUser, result.conversation.id);
+  // Create session with the new conversation ID (scoped by chatId)
+  const agentType = convType as ChannelAgentType;
+  const session = sessionManager.createSessionWithConversation(context.channelUser, result.conversation.id, agentType, undefined, channelChatId);
 
-  const markup = context.platform === 'lark' ? createMainMenuCard() : createMainMenuKeyboard();
+  const markup = context.platform === 'lark' ? createMainMenuCard() : context.platform === 'dingtalk' ? createDingTalkMainMenuCard() : createMainMenuKeyboard();
   return createSuccessResponse({
     type: 'text',
     text: `🆕 <b>New Session Created</b>\n\nSession ID: <code>${session.id.slice(-8)}</code>\n\nYou can start a new conversation now!`,
@@ -149,7 +214,7 @@ export const handleSessionStatus: ActionHandler = async (context) => {
   }
 
   const userId = context.channelUser?.id;
-  const session = userId ? sessionManager.getSession(userId) : null;
+  const session = userId ? sessionManager.getSession(userId, context.chatId) : null;
 
   // Use platform-specific markup
   if (context.platform === 'lark') {
@@ -158,6 +223,15 @@ export const handleSessionStatus: ActionHandler = async (context) => {
       type: 'text',
       text: '', // Lark card includes the text
       replyMarkup: createSessionStatusCard(sessionData),
+    });
+  }
+
+  if (context.platform === 'dingtalk') {
+    const sessionData = session ? { id: session.id, agentType: session.agentType, createdAt: session.createdAt, lastActivity: session.lastActivity } : undefined;
+    return createSuccessResponse({
+      type: 'text',
+      text: '', // DingTalk card includes the text
+      replyMarkup: createDingTalkSessionStatusCard(sessionData),
     });
   }
 
@@ -192,6 +266,13 @@ export const handleHelpShow: ActionHandler = async (context) => {
       replyMarkup: createHelpCard(),
     });
   }
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkHelpCard(),
+    });
+  }
   return createSuccessResponse({
     type: 'text',
     text: ['❓ <b>AionUi Assistant</b>', '', 'A remote assistant to interact with AionUi via Telegram.', '', '<b>Common Actions:</b>', '• 🆕 New Chat - Start a new session', '• 📊 Status - View current session status', '• ❓ Help - Show this help message', '', 'Send a message to chat with the AI assistant.'].join('\n'),
@@ -209,6 +290,13 @@ export const handleHelpFeatures: ActionHandler = async (context) => {
       type: 'text',
       text: '',
       replyMarkup: createFeaturesCard(),
+    });
+  }
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkFeaturesCard(),
     });
   }
   return createSuccessResponse({
@@ -230,6 +318,13 @@ export const handleHelpPairing: ActionHandler = async (context) => {
       replyMarkup: createPairingGuideCard(),
     });
   }
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkPairingGuideCard(),
+    });
+  }
   return createSuccessResponse({
     type: 'text',
     text: ['🔗 <b>Pairing Guide</b>', '', '<b>First-time Setup:</b>', '1. Send any message to the bot', '2. Bot displays pairing code', '3. Approve pairing in AionUi settings', '4. Ready to use after pairing', '', '<b>Notes:</b>', '• Pairing code valid for 10 minutes', '• AionUi app must be running', '• One Telegram account can only pair once'].join('\n'),
@@ -247,6 +342,13 @@ export const handleHelpTips: ActionHandler = async (context) => {
       type: 'text',
       text: '',
       replyMarkup: createTipsCard(),
+    });
+  }
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkTipsCard(),
     });
   }
   return createSuccessResponse({
@@ -268,6 +370,13 @@ export const handleSettingsShow: ActionHandler = async (context) => {
       replyMarkup: createSettingsCard(),
     });
   }
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkSettingsCard(),
+    });
+  }
   return createSuccessResponse({
     type: 'text',
     text: ['⚙️ <b>Settings</b>', '', 'Channel settings need to be configured in the AionUi app.', '', 'Open AionUi → WebUI → Channels'].join('\n'),
@@ -287,9 +396,9 @@ export const handleAgentShow: ActionHandler = async (context) => {
     return createErrorResponse('Session manager not available');
   }
 
-  // Get current agent type from session
+  // Get current agent type from session (scoped by chatId)
   const userId = context.channelUser?.id;
-  const session = userId ? sessionManager.getSession(userId) : null;
+  const session = userId ? sessionManager.getSession(userId, context.chatId) : null;
   const currentAgent = session?.agentType || 'gemini';
 
   // Get available agents dynamically
@@ -305,6 +414,14 @@ export const handleAgentShow: ActionHandler = async (context) => {
       type: 'text',
       text: '', // Lark card includes the text
       replyMarkup: createAgentSelectionCard(availableAgents, currentAgent),
+    });
+  }
+
+  if (context.platform === 'dingtalk') {
+    return createSuccessResponse({
+      type: 'text',
+      text: '',
+      replyMarkup: createDingTalkAgentSelectionCard(availableAgents, currentAgent),
     });
   }
 
@@ -340,12 +457,12 @@ export const handleAgentSelect: ActionHandler = async (context, params) => {
     return createErrorResponse('Invalid or unavailable agent type');
   }
 
-  // Get current session
-  const existingSession = sessionManager.getSession(context.channelUser.id);
+  // Get current session (scoped by chatId)
+  const existingSession = sessionManager.getSession(context.channelUser.id, context.chatId);
 
   // If same agent, no need to switch
   if (existingSession?.agentType === newAgentType) {
-    const markup = context.platform === 'lark' ? createMainMenuCard() : createMainMenuKeyboard();
+    const markup = context.platform === 'lark' ? createMainMenuCard() : context.platform === 'dingtalk' ? createDingTalkMainMenuCard() : createMainMenuKeyboard();
     return createSuccessResponse({
       type: 'text',
       text: `✓ Already using <b>${getAgentDisplayName(newAgentType)}</b>`,
@@ -354,7 +471,7 @@ export const handleAgentSelect: ActionHandler = async (context, params) => {
     });
   }
 
-  // Clear existing session and agent
+  // Clear existing session and agent (scoped by chatId)
   if (existingSession) {
     const messageService = getChannelMessageService();
     await messageService.clearContext(existingSession.id);
@@ -362,20 +479,17 @@ export const handleAgentSelect: ActionHandler = async (context, params) => {
     if (existingSession.conversationId) {
       try {
         WorkerManage.kill(existingSession.conversationId);
-        console.log(`[SystemActions] Killed old conversation for agent switch: ${existingSession.conversationId}`);
       } catch (err) {
         console.warn(`[SystemActions] Failed to kill old conversation:`, err);
       }
     }
   }
-  sessionManager.clearSession(context.channelUser.id);
+  sessionManager.clearSession(context.channelUser.id, context.chatId);
 
-  // Create new session with the selected agent type
-  const session = sessionManager.createSession(context.channelUser, newAgentType);
+  // Create new session with the selected agent type (scoped by chatId)
+  const session = sessionManager.createSession(context.channelUser, newAgentType, undefined, context.chatId);
 
-  console.log(`[SystemActions] Switched agent to ${newAgentType} for user ${context.channelUser.id}`);
-
-  const markup = context.platform === 'lark' ? createMainMenuCard() : createMainMenuKeyboard();
+  const markup = context.platform === 'lark' ? createMainMenuCard() : context.platform === 'dingtalk' ? createDingTalkMainMenuCard() : createMainMenuKeyboard();
   return createSuccessResponse({
     type: 'text',
     text: [`✓ <b>Switched to ${getAgentDisplayName(newAgentType)}</b>`, '', 'A new conversation has been started.', '', 'Send a message to begin!'].join('\n'),
@@ -392,6 +506,7 @@ function getAgentDisplayName(agentType: ChannelAgentType): string {
     gemini: '🤖 Gemini',
     acp: '🧠 Claude',
     codex: '⚡ Codex',
+    'openclaw-gateway': '🦞 OpenClaw',
   };
   return names[agentType] || agentType;
 }
@@ -405,6 +520,7 @@ function backendToChannelAgentType(backend: string): ChannelAgentType | null {
     gemini: 'gemini',
     claude: 'acp',
     codex: 'codex',
+    'openclaw-gateway': 'openclaw-gateway',
   };
   return mapping[backend] || null;
 }
@@ -417,6 +533,7 @@ function getAgentEmoji(backend: string): string {
     gemini: '🤖',
     claude: '🧠',
     codex: '⚡',
+    'openclaw-gateway': '🦞',
   };
   return emojis[backend] || '🤖';
 }

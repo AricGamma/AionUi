@@ -40,13 +40,20 @@ const ensureCliSafeSymlink = (targetPath: string, symlinkName: string): string =
       // Symlink exists, verify it points to the correct location
       const target = readlinkSync(symlinkPath);
       if (target === targetPath) {
+        // Ensure the target directory still exists (broken symlink if deleted, #841)
+        if (!existsSync(targetPath)) {
+          mkdirSync(targetPath, { recursive: true });
+        }
         return symlinkPath;
       }
       // Wrong target, remove and recreate
       unlinkSync(symlinkPath);
-    } else {
-      // Not a symlink (maybe a directory), don't touch it
+    } else if (stats.isDirectory()) {
+      // Real directory exists, don't touch it
       return targetPath;
+    } else {
+      // Regular file blocking the symlink path (#841), remove it
+      unlinkSync(symlinkPath);
     }
   } catch {
     // Symlink doesn't exist, create it
@@ -304,6 +311,7 @@ export const copyFilesToDirectory = async (dir: string, files?: string[], skipCl
   const { cacheDir } = getSystemDir();
   const tempDir = path.join(cacheDir, 'temp');
   const copiedFiles: string[] = [];
+  const resolvedDir = path.resolve(dir);
 
   for (const file of files) {
     // 确保文件路径是绝对路径
@@ -316,6 +324,14 @@ export const copyFilesToDirectory = async (dir: string, files?: string[], skipCl
       console.warn(`[AionUi] Source file does not exist, skipping: ${absoluteFilePath}`);
       console.warn(`[AionUi] Original path: ${file}`);
       // 跳过不存在的文件，而不是抛出错误
+      continue;
+    }
+
+    // Skip files that are already inside the target directory to avoid duplicates
+    // 跳过已在目标目录中的文件，避免创建重复副本
+    const resolvedFile = path.resolve(absoluteFilePath);
+    if (resolvedFile.startsWith(resolvedDir + path.sep)) {
+      copiedFiles.push(absoluteFilePath);
       continue;
     }
 
@@ -355,8 +371,24 @@ export const copyFilesToDirectory = async (dir: string, files?: string[], skipCl
 };
 
 export function ensureDirectory(dirPath: string): void {
-  if (existsSync(dirPath)) {
-    return;
+  try {
+    const stats = lstatSync(dirPath);
+    if (stats.isDirectory()) {
+      return;
+    }
+    if (stats.isSymbolicLink()) {
+      // Verify symlink target actually exists (#841 - broken symlink)
+      if (existsSync(dirPath)) {
+        return;
+      }
+      // Broken symlink, remove so mkdirSync can work on the real path
+      unlinkSync(dirPath);
+    } else {
+      // Regular file blocking the directory path (#841), remove it
+      unlinkSync(dirPath);
+    }
+  } catch {
+    // Path doesn't exist, create it
   }
   mkdirSync(dirPath, { recursive: true });
 }

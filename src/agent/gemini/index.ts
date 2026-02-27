@@ -13,20 +13,22 @@ import { NavigationInterceptor } from '@/common/navigation';
 import type { TProviderWithModel } from '@/common/storage';
 import { uuid } from '@/common/utils';
 import { getProviderAuthType } from '@/common/utils/platformAuthType';
+import { isNewApiPlatform } from '@/common/utils/platformConstants';
+import { normalizeNewApiBaseUrl } from '@/common/ClientFactory';
 import type { CompletedToolCall, Config, GeminiClient, ServerGeminiStreamEvent, ToolCall, ToolCallRequestInfo, Turn } from '@office-ai/aioncli-core';
-import { AuthType, CoreToolScheduler, FileDiscoveryService, sessionId, refreshServerHierarchicalMemory, clearOauthClientCache } from '@office-ai/aioncli-core';
+import { AuthType, clearOauthClientCache, CoreToolScheduler, FileDiscoveryService, refreshServerHierarchicalMemory, sessionId } from '@office-ai/aioncli-core';
+import fs from 'fs';
 import { ApiKeyManager } from '../../common/ApiKeyManager';
 import { handleAtCommand } from './cli/atCommandProcessor';
 import { loadCliConfig } from './cli/config';
 import { loadExtensions } from './cli/extension';
+import { getGlobalTokenManager } from './cli/oauthTokenManager';
 import type { Settings } from './cli/settings';
 import { loadSettings } from './cli/settings';
+import { globalToolCallGuard, type StreamConnectionEvent } from './cli/streamResilience';
 import { ConversationToolConfig } from './cli/tools/conversation-tool-config';
 import { mapToDisplay, type TrackedToolCall } from './cli/useReactToolScheduler';
-import { getPromptCount, handleCompletedTools, processGeminiStreamEvents, startNewPrompt } from './utils';
-import { globalToolCallGuard, type StreamConnectionEvent } from './cli/streamResilience';
-import { getGlobalTokenManager } from './cli/oauthTokenManager';
-import fs from 'fs';
+import { compactToolResponsesInHistory, getPromptCount, handleCompletedTools, processGeminiStreamEvents, startNewPrompt } from './utils';
 import path from 'path';
 import os from 'os';
 
@@ -176,13 +178,22 @@ export class GeminiAgent {
       delete process.env.GOOGLE_CLOUD_PROJECT;
       delete process.env.OPENAI_BASE_URL;
       delete process.env.OPENAI_API_KEY;
+      delete process.env.AWS_ACCESS_KEY_ID;
+      delete process.env.AWS_SECRET_ACCESS_KEY;
+      delete process.env.AWS_PROFILE;
+      delete process.env.AWS_REGION;
     };
 
     clearAllAuthEnvVars();
 
+    // 对 new-api 网关进行 URL 规范化（不同协议需要不同的 URL 格式）
+    // Normalize URL for new-api gateway (different protocols need different URL formats)
+    const isNewApi = isNewApiPlatform(this.model.platform);
+    const getBaseUrl = () => (isNewApi ? normalizeNewApiBaseUrl(this.model.baseUrl, this.authType) : this.model.baseUrl);
+
     if (this.authType === AuthType.USE_GEMINI) {
       fallbackValue('GEMINI_API_KEY', getCurrentApiKey());
-      fallbackValue('GOOGLE_GEMINI_BASE_URL', this.model.baseUrl);
+      fallbackValue('GOOGLE_GEMINI_BASE_URL', getBaseUrl());
       return;
     }
     if (this.authType === AuthType.USE_VERTEX_AI) {
@@ -205,13 +216,41 @@ export class GeminiAgent {
       return;
     }
     if (this.authType === AuthType.USE_OPENAI) {
-      fallbackValue('OPENAI_BASE_URL', this.model.baseUrl);
+      fallbackValue('OPENAI_BASE_URL', getBaseUrl());
       fallbackValue('OPENAI_API_KEY', getCurrentApiKey());
       return;
     }
     if (this.authType === AuthType.USE_ANTHROPIC) {
-      fallbackValue('ANTHROPIC_BASE_URL', this.model.baseUrl);
+      fallbackValue('ANTHROPIC_BASE_URL', getBaseUrl());
       fallbackValue('ANTHROPIC_API_KEY', getCurrentApiKey());
+      return;
+    }
+    if (this.authType === AuthType.USE_BEDROCK) {
+      const bedrockConfig = this.model.bedrockConfig;
+
+      if (!bedrockConfig) {
+        throw new Error('Bedrock configuration missing');
+      }
+
+      // Set region (required)
+      process.env.AWS_REGION = bedrockConfig.region;
+
+      if (bedrockConfig.authMethod === 'accessKey') {
+        if (!bedrockConfig.accessKeyId || !bedrockConfig.secretAccessKey) {
+          throw new Error('AWS credentials missing for access key authentication');
+        }
+        process.env.AWS_ACCESS_KEY_ID = bedrockConfig.accessKeyId;
+        process.env.AWS_SECRET_ACCESS_KEY = bedrockConfig.secretAccessKey;
+      } else if (bedrockConfig.authMethod === 'profile') {
+        if (!bedrockConfig.profile) {
+          throw new Error('AWS profile name missing');
+        }
+        process.env.AWS_PROFILE = bedrockConfig.profile;
+        // Clear access keys to ensure profile is used
+        delete process.env.AWS_ACCESS_KEY_ID;
+        delete process.env.AWS_SECRET_ACCESS_KEY;
+      }
+      return;
     }
   }
 
@@ -297,6 +336,9 @@ export class GeminiAgent {
       const enabledSet = new Set(this.enabledSkills);
       this.config.getSkillManager().filterSkills((skill) => enabledSet.has(skill.name));
       console.log(`[GeminiAgent] Filtered skills after initialize: ${this.enabledSkills.join(', ')}`);
+    } else {
+      // Non-preset agent: clear all optional skills (cron is injected via system instructions)
+      this.config.getSkillManager().filterSkills(() => false);
     }
 
     // 对于 Google OAuth 认证，先检查凭证是否存在，避免触发浏览器授权弹窗
@@ -323,6 +365,7 @@ export class GeminiAgent {
     // 对于 USE_OPENAI, USE_GEMINI, USE_ANTHROPIC 等，会创建相应的 Generator 但不会触发 OAuth
     // For USE_OPENAI, USE_GEMINI, USE_ANTHROPIC, etc., corresponding Generator is created without OAuth
     await this.config.refreshAuth(this.authType);
+    console.log(`[GeminiAgent] After refreshAuth — config.getModel(): "${this.config.getModel()}", authType used: ${this.authType}`);
 
     this.geminiClient = this.config.getGeminiClient();
 
@@ -542,6 +585,13 @@ export class GeminiAgent {
           // Schedule ALL tool requests including chrome-devtools
           // 调度所有工具请求，包括 chrome-devtools
           await this.scheduler.schedule(toolCallRequests, abortController.signal);
+        } else {
+          // Agentic loop finished (no pending tool calls).
+          // Compact large functionResponse entries in history to prevent
+          // context window overflow on subsequent turns.
+          if (this.geminiClient) {
+            compactToolResponsesInHistory(this.geminiClient);
+          }
         }
       })
       .catch((e: unknown) => {

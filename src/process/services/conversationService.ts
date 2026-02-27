@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { getChannelConversationName, isChannelPlatform } from '@/channels/types';
 import type { ICreateConversationParams } from '@/common/ipcBridge';
 import type { ConversationSource, TChatConversation, TProviderWithModel } from '@/common/storage';
 import { getDatabase } from '@process/database';
 import path from 'path';
-import { createAcpAgent, createCodexAgent, createGeminiAgent, createOpenClawAgent } from '../initAgent';
+import { createAcpAgent, createCodexAgent, createGeminiAgent, createNanobotAgent, createOpenClawAgent } from '../initAgent';
 import WorkerManage from '../WorkerManage';
 
 /**
@@ -31,6 +32,8 @@ export interface ICreateGeminiConversationParams {
   id?: string;
   /** 自定义会话名称 / Custom conversation name */
   name?: string;
+  /** Channel chat isolation ID (e.g. user:xxx, group:xxx) */
+  channelChatId?: string;
 }
 
 /**
@@ -40,6 +43,8 @@ export interface ICreateGeminiConversationParams {
 export interface ICreateConversationOptions extends ICreateConversationParams {
   /** 会话来源 / Conversation source */
   source?: ConversationSource;
+  /** Channel chat isolation ID (e.g. user:xxx, group:xxx) */
+  channelChatId?: string;
 }
 
 /**
@@ -83,13 +88,13 @@ export class ConversationService {
         conversation.name = params.name;
       }
 
-      // Set source
+      // Set source and channelChatId
       if (params.source) {
         conversation.source = params.source;
       }
-
-      // Register with WorkerManage
-      WorkerManage.buildConversation(conversation);
+      if (params.channelChatId) {
+        conversation.channelChatId = params.channelChatId;
+      }
 
       // Save to database
       const db = getDatabase();
@@ -99,7 +104,10 @@ export class ConversationService {
         return { success: false, error: result.error };
       }
 
-      console.log(`[ConversationService] Created conversation ${conversation.id} with source=${params.source || 'aionui'}`);
+      // Register with WorkerManage after DB save so early emitted messages can be persisted reliably.
+      WorkerManage.buildConversation(conversation);
+
+      console.log(`[ConversationService] Created conversation ${conversation.id} with source=${params.source || 'aionui'}, chatId=${params.channelChatId || 'none'}`);
       return { success: true, conversation };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -134,18 +142,20 @@ export class ConversationService {
         const enabledSkills = extraWithPresets.enabledSkills;
         const presetAssistantId = extraWithPresets.presetAssistantId;
 
-        conversation = await createGeminiAgent(model, extra.workspace, extra.defaultFiles, extra.webSearchEngine, extra.customWorkspace, contextFileName, presetRules, enabledSkills, presetAssistantId);
+        conversation = await createGeminiAgent(model, extra.workspace, extra.defaultFiles, extra.webSearchEngine, extra.customWorkspace, contextFileName, presetRules, enabledSkills, presetAssistantId, extra.sessionMode);
       } else if (type === 'acp') {
         conversation = await createAcpAgent(params);
       } else if (type === 'codex') {
         conversation = await createCodexAgent(params);
       } else if (type === 'openclaw-gateway') {
         conversation = await createOpenClawAgent(params);
+      } else if (type === 'nanobot') {
+        conversation = await createNanobotAgent(params);
       } else {
         return { success: false, error: 'Invalid conversation type' };
       }
 
-      // Apply custom ID, name and source
+      // Apply custom ID, name, source, and channelChatId
       if (name) {
         conversation.name = name;
       }
@@ -155,11 +165,9 @@ export class ConversationService {
       if (source) {
         conversation.source = source;
       }
-
-      // Register with WorkerManage
-      // Note: Don't call initAgent() here - let it be lazy initialized when sendMessage() is called
-      // This allows frontend to check agent availability and show AgentSetupCard before auth flow
-      WorkerManage.buildConversation(conversation);
+      if (params.channelChatId) {
+        conversation.channelChatId = params.channelChatId;
+      }
 
       // Save to database
       const db = getDatabase();
@@ -168,6 +176,10 @@ export class ConversationService {
         console.error('[ConversationService] Failed to create conversation in database:', result.error);
         return { success: false, error: result.error };
       }
+
+      // Register with WorkerManage after DB save so early emitted messages can be persisted reliably.
+      // Note: Don't call initAgent() here - let it be lazy initialized when sendMessage() is called.
+      WorkerManage.buildConversation(conversation);
 
       console.log(`[ConversationService] Created ${type} conversation ${conversation.id} with source=${source || 'aionui'}`);
       return { success: true, conversation };
@@ -187,27 +199,30 @@ export class ConversationService {
   }
 
   /**
-   * 获取或创建 Telegram 会话
-   * Get or create a Telegram conversation
+   * 获取或创建指定渠道的会话
+   * Get or create a conversation for the specified channel
    *
-   * 优先复用最后一个 source='telegram' 的会话，没有则创建新会话
-   * Prefers reusing the latest conversation with source='telegram', creates new if none exists
+   * 优先复用最后一个对应 source 的会话，没有则创建新会话
+   * Prefers reusing the latest conversation with matching source, creates new if none exists
    */
-  static async getOrCreateTelegramConversation(params: ICreateGeminiConversationParams): Promise<ICreateConversationResult> {
+  static async getOrCreateChannelConversation(params: ICreateGeminiConversationParams & { source: ConversationSource }): Promise<ICreateConversationResult> {
     const db = getDatabase();
+    const source = params.source;
 
-    // Try to find existing telegram conversation
-    const latestTelegramConv = db.getLatestConversationBySource('telegram');
-    if (latestTelegramConv.success && latestTelegramConv.data) {
-      console.log(`[ConversationService] Reusing existing telegram conversation: ${latestTelegramConv.data.id}`);
-      return { success: true, conversation: latestTelegramConv.data };
+    // Per-chat lookup: find existing conversation by source + channelChatId + type, or create new
+    if (params.channelChatId) {
+      const latestConv = db.findChannelConversation(source, params.channelChatId, 'gemini');
+      if (latestConv.success && latestConv.data) {
+        console.log(`[ConversationService] Reusing existing ${source} conversation for chatId=${params.channelChatId}: ${latestConv.data.id}`);
+        return { success: true, conversation: latestConv.data };
+      }
     }
 
-    // Create new telegram conversation
+    // No channelChatId or no existing conversation found — always create new
     return this.createGeminiConversation({
       ...params,
-      source: 'telegram',
-      name: params.name || 'Telegram Assistant',
+      source,
+      name: params.name || (isChannelPlatform(source) ? getChannelConversationName(source, 'gemini', undefined, params.channelChatId) : `${source} Assistant`),
     });
   }
 }
@@ -215,4 +230,4 @@ export class ConversationService {
 // Export convenience functions
 export const createGeminiConversation = ConversationService.createGeminiConversation.bind(ConversationService);
 export const createConversation = ConversationService.createConversation.bind(ConversationService);
-export const getOrCreateTelegramConversation = ConversationService.getOrCreateTelegramConversation.bind(ConversationService);
+export const getOrCreateChannelConversation = ConversationService.getOrCreateChannelConversation.bind(ConversationService);
