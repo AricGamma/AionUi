@@ -6,16 +6,17 @@
 
 import { channelEventBus } from '@/channels/agent/ChannelEventBus';
 import { ipcBridge } from '@/common';
-import type { CronMessageMeta, IMessageToolGroup, TMessage } from '@/common/chatLib';
+import type { CronMessageMeta, IMessageText, IMessageToolGroup, TMessage } from '@/common/chatLib';
 import { transformMessage } from '@/common/chatLib';
 import type { IResponseMessage } from '@/common/ipcBridge';
 import type { IMcpServer, TProviderWithModel } from '@/common/storage';
 import { ProcessConfig, getSkillsDir } from '@/process/initStorage';
+import { ExtensionRegistry } from '@/extensions';
 import { buildSystemInstructionsWithSkillsIndex } from './agentUtils';
 import { detectSkillLoadRequest, AcpSkillManager, buildSkillContentText } from './AcpSkillManager';
 import { uuid } from '@/common/utils';
 import { getProviderAuthType } from '@/common/utils/platformAuthType';
-import { AuthType, getOauthInfoWithCache } from '@office-ai/aioncli-core';
+import { AuthType, getOauthInfoWithCache, Storage } from '@office-ai/aioncli-core';
 import { GeminiApprovalStore } from '../../agent/gemini/GeminiApprovalStore';
 import { ToolConfirmationOutcome } from '../../agent/gemini/cli/tools/tools';
 import { getDatabase } from '@process/database';
@@ -23,9 +24,11 @@ import { addMessage, addOrUpdateMessage, nextTickToLocalFinish } from '../messag
 import { cronBusyGuard } from '@process/services/cron/CronBusyGuard';
 import { handlePreviewOpenEvent } from '../utils/previewUtils';
 import BaseAgentManager from './BaseAgentManager';
+import { mainLog, mainWarn, mainError } from '../utils/mainLogger';
 import { hasCronCommands } from './CronCommandDetector';
 import { extractTextFromMessage, processCronInMessage } from './MessageMiddleware';
 import { stripThinkTags } from './ThinkTagDetector';
+import * as fs from 'node:fs';
 
 // gemini agent管理器类
 type UiMcpServerConfig = {
@@ -74,7 +77,20 @@ export class GeminiAgentManager extends BaseAgentManager<
   readonly approvalStore = new GeminiApprovalStore();
 
   private async injectHistoryFromDatabase(): Promise<void> {
-    // ... (omitting injectHistoryFromDatabase for space)
+    try {
+      const result = getDatabase().getConversationMessages(this.conversation_id, 0, 10000);
+      const data = (result.data || []) as TMessage[];
+      const lines = data
+        .filter((m): m is IMessageText => m.type === 'text')
+        .slice(-20)
+        .map((m) => `${m.position === 'right' ? 'User' : 'Assistant'}: ${m.content.content || ''}`);
+      const text = lines.join('\n').slice(-4000);
+      if (text) {
+        await this.postMessagePromise('init.history', { text });
+      }
+    } catch (e) {
+      // ignore history injection errors
+    }
   }
 
   /** Force yolo mode (for cron jobs) / 强制 yolo 模式（用于定时任务） */
@@ -132,9 +148,12 @@ export class GeminiAgentManager extends BaseAgentManager<
 
         if (needsGoogleOAuth) {
           try {
-            const oauthInfo = await getOauthInfoWithCache(config?.proxy);
-            if (oauthInfo && oauthInfo.email && config?.accountProjects) {
-              projectId = config.accountProjects[oauthInfo.email];
+            const credsPath = Storage.getOAuthCredsPath();
+            if (fs.existsSync(credsPath)) {
+              const oauthInfo = await getOauthInfoWithCache(config?.proxy);
+              if (oauthInfo && oauthInfo.email && config?.accountProjects) {
+                projectId = config.accountProjects[oauthInfo.email];
+              }
             }
           } catch {
             // If account retrieval fails, don't set projectId
@@ -222,19 +241,47 @@ export class GeminiAgentManager extends BaseAgentManager<
   private async getMcpServers(): Promise<Record<string, UiMcpServerConfig>> {
     try {
       const mcpServers = await ProcessConfig.get('mcp.config');
-      if (!mcpServers || !Array.isArray(mcpServers)) {
+      const allServers: IMcpServer[] = Array.isArray(mcpServers) ? mcpServers : [];
+
+      // Merge extension-contributed MCP servers
+      // 合并扩展贡献的 MCP servers
+      try {
+        const registry = ExtensionRegistry.getInstance();
+        const extServers = registry.getMcpServers();
+        for (const extServer of extServers) {
+          const transport = extServer.transport as IMcpServer['transport'];
+          if (!transport) continue;
+          // Only include enabled extension servers (they don't have status since they're declarative)
+          if (extServer.enabled === false) continue;
+          allServers.push({
+            id: String(extServer.id || ''),
+            name: String(extServer.name || ''),
+            description: extServer.description as string | undefined,
+            enabled: true,
+            transport,
+            status: 'connected', // Extension MCP servers are treated as available
+            createdAt: (extServer.createdAt as number) || Date.now(),
+            updatedAt: (extServer.updatedAt as number) || Date.now(),
+            originalJson: String(extServer.originalJson || '{}'),
+          });
+        }
+      } catch (extError) {
+        console.warn('[GeminiAgentManager] Failed to load extension MCP servers:', extError);
+      }
+
+      if (allServers.length === 0) {
         this.mcpFingerprint = '[]';
         return {};
       }
 
       // Store fingerprint for later change detection
       // 保存指纹用于后续变更检测
-      this.mcpFingerprint = GeminiAgentManager.computeMcpFingerprint(mcpServers);
+      this.mcpFingerprint = GeminiAgentManager.computeMcpFingerprint(allServers);
 
       // 转换为 aioncli-core 期望的格式
       // MCPServerConfig supports: stdio (command/args/env), sse/http (url/type/headers)
       const mcpConfig: Record<string, UiMcpServerConfig> = {};
-      mcpServers
+      allServers
         .filter((server: IMcpServer) => server.enabled && server.status === 'connected') // 只使用启用且连接成功的服务器
         .forEach((server: IMcpServer) => {
           if (server.transport.type === 'stdio') {
@@ -303,6 +350,7 @@ export class GeminiAgentManager extends BaseAgentManager<
     await this.refreshWorkerIfMcpChanged();
     this.status = 'pending';
     cronBusyGuard.setProcessing(this.conversation_id, true);
+
     const result = await this.bootstrap
       .catch((e) => {
         cronBusyGuard.setProcessing(this.conversation_id, false);
@@ -334,16 +382,16 @@ export class GeminiAgentManager extends BaseAgentManager<
       const currentFingerprint = GeminiAgentManager.computeMcpFingerprint(mcpServers);
 
       if (currentFingerprint !== this.mcpFingerprint) {
-        console.log(`[GeminiAgentManager] MCP config changed (${this.mcpFingerprint} -> ${currentFingerprint}), re-bootstrapping worker...`);
+        mainLog('[GeminiAgentManager]', `MCP config changed (${this.mcpFingerprint} -> ${currentFingerprint}), re-bootstrapping worker...`);
         // Kill old worker process and its child processes (MCP server connections)
         this.kill();
         // Re-bootstrap with fresh config (getMcpServers will update the fingerprint)
         this.bootstrap = this.createBootstrap();
         await this.bootstrap;
-        console.log('[GeminiAgentManager] Worker re-bootstrapped with updated MCP config');
+        mainLog('[GeminiAgentManager]', 'Worker re-bootstrapped with updated MCP config');
       }
     } catch (error) {
-      console.warn('[GeminiAgentManager] Failed to check MCP config changes:', error);
+      mainWarn('[GeminiAgentManager]', 'Failed to check MCP config changes', error);
       // Don't block message sending on MCP check failure
     }
   }
@@ -527,6 +575,22 @@ export class GeminiAgentManager extends BaseAgentManager<
       }
       if (data.type === 'start') {
         this.status = 'running';
+        const traceData = {
+          agentType: 'gemini' as const,
+          provider: this.model.name,
+          modelId: this.model.useModel,
+          baseUrl: this.model.baseUrl,
+          platform: this.model.platform,
+          authType: getProviderAuthType(this.model),
+          timestamp: Date.now(),
+        };
+        // Emit request trace on each model generation start
+        ipcBridge.geminiConversation.responseStream.emit({
+          type: 'request_trace',
+          conversation_id: this.conversation_id,
+          msg_id: uuid(),
+          data: traceData,
+        });
       }
 
       // 处理预览打开事件（chrome-devtools 导航触发）/ Handle preview open event (triggered by chrome-devtools navigation)
@@ -728,7 +792,7 @@ export class GeminiAgentManager extends BaseAgentManager<
         db.updateConversation(this.conversation_id, { extra: updatedExtra } as Partial<typeof conversation>);
       }
     } catch (error) {
-      console.error('[GeminiAgentManager] Failed to save session mode:', error);
+      mainError('[GeminiAgentManager]', 'Failed to save session mode', error);
     }
   }
 
@@ -744,7 +808,7 @@ export class GeminiAgentManager extends BaseAgentManager<
         await ProcessConfig.set('gemini.config', { ...config, yoloMode: false });
       }
     } catch (error) {
-      console.error('[GeminiAgentManager] Failed to clear legacy yoloMode config:', error);
+      mainError('[GeminiAgentManager]', 'Failed to clear legacy yoloMode config', error);
     }
   }
 

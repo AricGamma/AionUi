@@ -12,7 +12,7 @@ import { allSupportedExts } from '@/renderer/services/FileService';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/fileSelection';
 import { Button, Tag } from '@arco-design/web-react';
-import { Plus } from '@icon-park/react';
+import { Plus, Shield } from '@icon-park/react';
 import { iconColors } from '@/renderer/theme/colors';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -20,8 +20,13 @@ import FilePreview from '@/renderer/components/FilePreview';
 import HorizontalFileList from '@/renderer/components/HorizontalFileList';
 import { usePreviewContext } from '@/renderer/pages/conversation/preview';
 import { useLatestRef } from '@/renderer/hooks/useLatestRef';
+import { useOpenFileSelector } from '@/renderer/hooks/useOpenFileSelector';
+import type { TokenUsageData } from '@/common/storage';
+import ContextUsageIndicator from '@/renderer/components/ContextUsageIndicator';
 import { useAutoTitle } from '@/renderer/hooks/useAutoTitle';
 import AgentModeSelector from '@/renderer/components/AgentModeSelector';
+import AcpConfigSelector from '@/renderer/components/AcpConfigSelector';
+import { useSlashCommands } from '@/renderer/hooks/useSlashCommands';
 
 const useAcpSendBoxDraft = getSendBoxDraftHook('acp', {
   _type: 'acp',
@@ -39,6 +44,8 @@ const useAcpMessage = (conversation_id: string) => {
   });
   const [acpStatus, setAcpStatus] = useState<'connecting' | 'connected' | 'authenticated' | 'session_active' | 'disconnected' | 'error' | null>(null);
   const [aiProcessing, setAiProcessing] = useState(false); // New loading state for AI response
+  const [tokenUsage, setTokenUsage] = useState<TokenUsageData | null>(null);
+  const [contextLimit, setContextLimit] = useState<number>(0);
 
   // Use refs to sync state for immediate access in event handlers
   // 使用 ref 同步状态，以便在事件处理程序中立即访问
@@ -48,6 +55,14 @@ const useAcpMessage = (conversation_id: string) => {
   // Track whether current turn has content output
   // Only reset aiProcessing when finish arrives after content (not after tool calls)
   const hasContentInTurnRef = useRef(false);
+
+  // Track request trace state for displaying complete request lifecycle
+  const requestTraceRef = useRef<{
+    startTime: number;
+    backend: string;
+    modelId: string;
+    sessionMode?: string;
+  } | null>(null);
 
   // Think 消息节流：限制更新频率，减少渲染次数
   // Throttle thought updates to reduce render frequency
@@ -142,6 +157,12 @@ const useAcpMessage = (conversation_id: string) => {
             }, 1000);
             (window as unknown as { __acpFinishTimeout?: ReturnType<typeof setTimeout> }).__acpFinishTimeout = timeoutId;
             hasContentInTurnRef.current = false;
+            // Log request completion
+            if (requestTraceRef.current) {
+              const duration = Date.now() - requestTraceRef.current.startTime;
+              console.log(`%c[RequestTrace]%c ✅ FINISH | ${requestTraceRef.current.backend} → ${requestTraceRef.current.modelId} | ${duration}ms | ${new Date().toISOString()}`, 'color: #52c41a; font-weight: bold', 'color: inherit');
+              requestTraceRef.current = null;
+            }
           }
           break;
         case 'content':
@@ -199,6 +220,28 @@ const useAcpMessage = (conversation_id: string) => {
         case 'acp_model_info':
           // Model info updates are handled by AcpModelSelector, no action needed here
           break;
+        case 'acp_context_usage': {
+          const usageData = message.data as { used: number; size: number };
+          if (usageData && typeof usageData.used === 'number') {
+            setTokenUsage({ totalTokens: usageData.used });
+            if (usageData.size > 0) {
+              setContextLimit(usageData.size);
+            }
+          }
+          break;
+        }
+        case 'request_trace':
+          {
+            const trace = message.data as Record<string, unknown>;
+            requestTraceRef.current = {
+              startTime: Number(trace.timestamp) || Date.now(),
+              backend: String(trace.backend || 'unknown'),
+              modelId: String(trace.modelId || 'unknown'),
+              sessionMode: trace.sessionMode as string | undefined,
+            };
+            console.log(`%c[RequestTrace]%c ➡️ START | ${trace.backend} → ${trace.modelId} | ${new Date().toISOString()}`, 'color: #1890ff; font-weight: bold', 'color: inherit', trace);
+          }
+          break;
         case 'error':
           // Stop all loading states when error occurs
           setRunning(false);
@@ -206,6 +249,12 @@ const useAcpMessage = (conversation_id: string) => {
           setAiProcessing(false);
           aiProcessingRef.current = false;
           addOrUpdateMessage(transformedMessage);
+          // Log request error
+          if (requestTraceRef.current) {
+            const duration = Date.now() - requestTraceRef.current.startTime;
+            console.log(`%c[RequestTrace]%c ❌ ERROR | ${requestTraceRef.current.backend} → ${requestTraceRef.current.modelId} | ${duration}ms | ${new Date().toISOString()}`, 'color: #ff4d4f; font-weight: bold', 'color: inherit', message.data);
+            requestTraceRef.current = null;
+          }
           break;
         default:
           // Auto-recover running state if other messages arrive after finish
@@ -235,6 +284,8 @@ const useAcpMessage = (conversation_id: string) => {
 
     setThought({ subject: '', description: '' });
     setAcpStatus(null);
+    setTokenUsage(null);
+    setContextLimit(0);
     hasContentInTurnRef.current = false;
 
     // Check actual conversation status from backend before resetting running/aiProcessing
@@ -253,6 +304,17 @@ const useAcpMessage = (conversation_id: string) => {
       runningRef.current = isRunning;
       setAiProcessing(isRunning);
       aiProcessingRef.current = isRunning;
+
+      // Restore persisted context usage data
+      if (res.type === 'acp' && res.extra?.lastTokenUsage) {
+        const { lastTokenUsage, lastContextLimit } = res.extra;
+        if (lastTokenUsage.totalTokens > 0) {
+          setTokenUsage(lastTokenUsage);
+        }
+        if (lastContextLimit && lastContextLimit > 0) {
+          setContextLimit(lastContextLimit);
+        }
+      }
     });
   }, [conversation_id]);
 
@@ -272,7 +334,7 @@ const useAcpMessage = (conversation_id: string) => {
     hasContentInTurnRef.current = false;
   }, []);
 
-  return { thought, setThought, running, acpStatus, aiProcessing, setAiProcessing, resetState };
+  return { thought, setThought, running, acpStatus, aiProcessing, setAiProcessing, resetState, tokenUsage, contextLimit };
 };
 
 const EMPTY_AT_PATH: Array<string | FileOrFolderItem> = [];
@@ -314,10 +376,12 @@ const AcpSendBox: React.FC<{
   conversation_id: string;
   backend: AcpBackend;
   sessionMode?: string;
-}> = ({ conversation_id, backend, sessionMode }) => {
-  const { thought, running, aiProcessing, setAiProcessing, resetState } = useAcpMessage(conversation_id);
+  agentName?: string;
+}> = ({ conversation_id, backend, sessionMode, agentName }) => {
+  const { thought, running, acpStatus, aiProcessing, setAiProcessing, resetState, tokenUsage, contextLimit } = useAcpMessage(conversation_id);
   const { t } = useTranslation();
   const { checkAndUpdateTitle } = useAutoTitle();
+  const slashCommands = useSlashCommands(conversation_id, { agentStatus: acpStatus });
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
   const { setSendBoxHandler } = usePreviewContext();
 
@@ -439,9 +503,8 @@ const AcpSendBox: React.FC<{
     const atPathFiles = atPath.map((item) => (typeof item === 'string' ? item : item.path));
     const allFiles = [...uploadFile, ...atPathFiles];
 
-    // 立即清空输入框，避免用户误以为消息没发送
-    // Clear input immediately to avoid user thinking message wasn't sent
-    setContent('');
+    // Content is already cleared by the shared SendBox component (setInput(''))
+    // before calling onSend — no need to clear again here.
     clearFiles();
 
     // Start AI processing loading state
@@ -495,6 +558,16 @@ const AcpSendBox: React.FC<{
     }
   };
 
+  const appendSelectedFiles = useCallback(
+    (files: string[]) => {
+      setUploadFile((prev) => [...prev, ...files]);
+    },
+    [setUploadFile]
+  );
+  const { openFileSelector, onSlashBuiltinCommand } = useOpenFileSelector({
+    onFilesSelected: appendSelectedFiles,
+  });
+
   useAddEventListener('acp.selected.file', setAtPath);
   useAddEventListener('acp.selected.file.append', (items: Array<string | FileOrFolderItem>) => {
     const merged = mergeFileSelectionItems(atPathRef.current, items);
@@ -522,7 +595,7 @@ const AcpSendBox: React.FC<{
         onChange={setContent}
         loading={running || aiProcessing}
         disabled={false}
-        placeholder={t('acp.sendbox.placeholder', { backend, defaultValue: `Send message to {{backend}}...` })}
+        placeholder={t('acp.sendbox.placeholder', { backend: agentName || backend, defaultValue: `Send message to {{backend}}...` })}
         onStop={handleStop}
         className='z-10'
         onFilesAdded={handleFilesAdded}
@@ -531,19 +604,9 @@ const AcpSendBox: React.FC<{
         lockMultiLine={true}
         tools={
           <div className='flex items-center gap-4px'>
-            <Button
-              type='secondary'
-              shape='circle'
-              icon={<Plus theme='outline' size='14' strokeWidth={2} fill={iconColors.primary} />}
-              onClick={() => {
-                void ipcBridge.dialog.showOpen.invoke({ properties: ['openFile', 'multiSelections'] }).then((files) => {
-                  if (files && files.length > 0) {
-                    setUploadFile([...uploadFile, ...files]);
-                  }
-                });
-              }}
-            />
-            <AgentModeSelector backend={backend} conversationId={conversation_id} compact initialMode={sessionMode} />
+            <Button type='secondary' shape='circle' icon={<Plus theme='outline' size='14' strokeWidth={2} fill={iconColors.primary} />} onClick={openFileSelector} />
+            <AgentModeSelector backend={backend} conversationId={conversation_id} compact initialMode={sessionMode} compactLeadingIcon={<Shield theme='outline' size='14' fill={iconColors.secondary} />} modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })} compactLabelPrefix={t('agentMode.permission')} hideCompactLabelPrefixOnMobile />
+            <AcpConfigSelector conversationId={conversation_id} backend={backend} />
           </div>
         }
         prefix={
@@ -602,6 +665,9 @@ const AcpSendBox: React.FC<{
           </>
         }
         onSend={onSendHandler}
+        slashCommands={slashCommands}
+        onSlashBuiltinCommand={onSlashBuiltinCommand}
+        sendButtonPrefix={tokenUsage ? <ContextUsageIndicator tokenUsage={tokenUsage} contextLimit={contextLimit > 0 ? contextLimit : undefined} size={24} /> : undefined}
       ></SendBox>
     </div>
   );

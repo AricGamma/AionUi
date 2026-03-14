@@ -9,8 +9,9 @@ import { extractAtPaths, parseAllAtCommands, reconstructQuery } from '@/common/a
 import type { TMessage } from '@/common/chatLib';
 import type { IResponseMessage } from '@/common/ipcBridge';
 import { NavigationInterceptor } from '@/common/navigation';
+import type { SlashCommandItem } from '@/common/slash/types';
 import { uuid } from '@/common/utils';
-import type { AcpBackend, AcpModelInfo, AcpPermissionRequest, AcpResult, AcpSessionUpdate, ToolCallUpdate } from '@/types/acpTypes';
+import type { AcpBackend, AcpModelInfo, AcpPermissionRequest, AcpPromptResponseUsage, AcpResult, AcpSessionConfigOption, AcpSessionUpdate, AvailableCommandsUpdate, ToolCallUpdate } from '@/types/acpTypes';
 import { AcpErrorType, createAcpError } from '@/types/acpTypes';
 import { spawn } from 'child_process';
 import { promises as fs } from 'fs';
@@ -20,6 +21,8 @@ import { getEnhancedEnv, resolveNpxPath } from '@process/utils/shellEnv';
 import { AcpApprovalStore, createAcpApprovalKey } from './ApprovalStore';
 import { CLAUDE_YOLO_SESSION_MODE, CODEBUDDY_YOLO_SESSION_MODE, IFLOW_YOLO_SESSION_MODE, QWEN_YOLO_SESSION_MODE } from './constants';
 import { getClaudeModel } from './utils';
+import { buildAcpModelInfo, summarizeAcpModelInfo } from './modelInfo';
+import { mainLog } from '@process/utils/mainLogger';
 
 /** Enable ACP performance diagnostics via ACP_PERF=1 */
 const ACP_PERF_LOG = process.env.ACP_PERF === '1';
@@ -35,6 +38,12 @@ interface InitializeResult {
   }>;
   [key: string]: unknown;
 }
+
+/**
+ * ACP available command type - subset of SlashCommandItem for ACP protocol layer
+ * ACP 可用命令类型 - SlashCommandItem 的子集，用于 ACP 协议层
+ */
+export type AcpAvailableCommand = Pick<SlashCommandItem, 'name' | 'description' | 'hint'>;
 
 /**
  * Helper function to normalize tool call status
@@ -69,6 +78,8 @@ export interface AcpAgentConfig {
     customArgs?: string[];
     customEnv?: Record<string, string>;
     yoloMode?: boolean;
+    /** Display name for the agent (from extension or custom config) / Agent 显示名称 */
+    agentName?: string;
     /** ACP session ID for resume support / ACP session ID 用于会话恢复 */
     acpSessionId?: string;
     /** Last update time of ACP session / ACP session 最后更新时间 */
@@ -78,6 +89,8 @@ export interface AcpAgentConfig {
   onSignalEvent?: (data: IResponseMessage) => void; // 新增：仅发送信号，不更新UI
   /** Callback when ACP session ID is updated / 当 ACP session ID 更新时的回调 */
   onSessionIdUpdate?: (sessionId: string) => void;
+  /** Callback when ACP agent updates available slash commands / ACP 可用斜杠命令更新回调 */
+  onAvailableCommandsUpdate?: (commands: AcpAvailableCommand[]) => void;
 }
 
 // ACP agent任务类
@@ -91,6 +104,8 @@ export class AcpAgent {
     customArgs?: string[];
     customEnv?: Record<string, string>;
     yoloMode?: boolean;
+    /** Display name for the agent (from extension or custom config) / Agent 显示名称 */
+    agentName?: string;
     /** ACP session ID for resume support / ACP session ID 用于会话恢复 */
     acpSessionId?: string;
     /** Last update time of ACP session / ACP session 最后更新时间 */
@@ -103,6 +118,7 @@ export class AcpAgent {
   private readonly onStreamEvent: (data: IResponseMessage) => void;
   private readonly onSignalEvent?: (data: IResponseMessage) => void;
   private readonly onSessionIdUpdate?: (sessionId: string) => void;
+  private readonly onAvailableCommandsUpdate?: (commands: AcpAvailableCommand[]) => void;
 
   // Track pending navigation tool calls for URL extraction from results
   // 跟踪待处理的导航工具调用，以便从结果中提取 URL
@@ -125,11 +141,15 @@ export class AcpAgent {
   // Store permission request metadata for later use in confirmMessage
   private permissionRequestMeta = new Map<string, { kind?: string; title?: string; rawInput?: Record<string, unknown> }>();
 
+  // Whether usage_update session notifications have been received (if so, skip PromptResponse.usage fallback)
+  private hasReceivedUsageUpdate = false;
+
   constructor(config: AcpAgentConfig) {
     this.id = config.id;
     this.onStreamEvent = config.onStreamEvent;
     this.onSignalEvent = config.onSignalEvent;
     this.onSessionIdUpdate = config.onSessionIdUpdate;
+    this.onAvailableCommandsUpdate = config.onAvailableCommandsUpdate;
     this.extra = config.extra || {
       workspace: config.workingDir,
       backend: config.backend,
@@ -155,6 +175,9 @@ export class AcpAgent {
     };
     this.connection.onEndTurn = () => {
       this.handleEndTurn();
+    };
+    this.connection.onPromptUsage = (usage: AcpPromptResponseUsage) => {
+      this.handlePromptUsage(usage);
     };
     this.connection.onFileOperation = (operation) => {
       this.handleFileOperation(operation);
@@ -207,7 +230,20 @@ export class AcpAgent {
 
       const connectStart = Date.now();
       try {
-        await Promise.race([this.connection.connect(this.extra.backend, this.extra.cliPath, this.extra.workspace, this.extra.customArgs, this.extra.customEnv), connectTimeoutPromise]);
+        const tryConnect = async () => {
+          await Promise.race([this.connection.connect(this.extra.backend, this.extra.cliPath, this.extra.workspace, this.extra.customArgs, this.extra.customEnv), connectTimeoutPromise]);
+        };
+
+        try {
+          await tryConnect();
+        } catch (firstError) {
+          // Transient startup failures (env race / process warmup) are common on first try.
+          // Retry once after a short backoff to reduce "need multiple clicks to connect".
+          console.warn('[ACP] First connect attempt failed, retrying once:', firstError instanceof Error ? firstError.message : String(firstError));
+          await this.connection.disconnect();
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          await tryConnect();
+        }
       } finally {
         if (connectTimeoutId) {
           clearTimeout(connectTimeoutId);
@@ -262,7 +298,15 @@ export class AcpAgent {
             await this.connection.setModel(configuredModel);
             if (ACP_PERF_LOG) console.log(`[ACP-PERF] start: model set ${Date.now() - modelStart}ms`);
           } catch (error) {
-            console.warn(`[ACP] Failed to set model from settings: ${error instanceof Error ? error.message : String(error)}`);
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.warn(`[ACP] Failed to set model from settings: ${errMsg}`);
+            // Detect third-party relay/proxy errors (e.g., NewAPI/OneAPI "model_not_found").
+            // These services route by model name and may not have channels configured for
+            // specific model IDs like "claude-sonnet-4-6". Emit a visible warning so the
+            // user knows to update their relay's model configuration.
+            if (errMsg.includes('model_not_found') || errMsg.includes('无可用渠道')) {
+              this.emitErrorMessage(`Model "${configuredModel}" is not available on your API relay service. ` + `Please add this model to your relay's channel configuration, ` + `or update ANTHROPIC_MODEL in ~/.claude/settings.json to a supported model name. ` + `Falling back to the relay's default model.`);
+            }
           }
         }
       }
@@ -305,40 +349,28 @@ export class AcpAgent {
    * Prefers stable configOptions API, falls back to unstable models API.
    */
   getModelInfo(): AcpModelInfo | null {
-    // Try stable API first: configOptions with category 'model'
-    const configOptions = this.connection.getConfigOptions();
-    if (configOptions) {
-      const modelOption = configOptions.find((opt) => opt.category === 'model');
-      if (modelOption && modelOption.type === 'select' && modelOption.options) {
-        // Support both currentValue (ACP spec) and selectedValue (some agents)
-        const activeValue = modelOption.currentValue || modelOption.selectedValue || null;
-        return {
-          currentModelId: activeValue,
-          currentModelLabel: modelOption.options.find((o) => o.value === activeValue)?.name || modelOption.options.find((o) => o.value === activeValue)?.label || activeValue,
-          availableModels: modelOption.options.map((o) => ({ id: o.value, label: o.name || o.label || o.value })),
-          canSwitch: modelOption.options.length > 1,
-          source: 'configOption',
-          configOptionId: modelOption.id,
-        };
-      }
-    }
+    return buildAcpModelInfo(this.connection.getConfigOptions(), this.connection.getModels());
+  }
 
-    // Fallback to unstable models API
-    const models = this.connection.getModels();
-    if (models) {
-      const available = models.availableModels || [];
-      // Support both 'id' (spec) and 'modelId' (OpenCode) field names
-      const getModelId = (m: (typeof available)[0]) => m.id || m.modelId || '';
-      return {
-        currentModelId: models.currentModelId || null,
-        currentModelLabel: available.find((m) => getModelId(m) === models.currentModelId)?.name || models.currentModelId || null,
-        availableModels: available.map((m) => ({ id: getModelId(m), label: m.name || getModelId(m) })),
-        canSwitch: available.length > 1,
-        source: 'models',
-      };
-    }
+  /**
+   * Get non-model, non-mode config options from ACP connection.
+   * Filters out model-category options (handled by AcpModelSelector)
+   * and mode-category options (handled by AgentModeSelector).
+   * Returns options like reasoning effort, output format, etc.
+   */
+  getConfigOptions(): AcpSessionConfigOption[] {
+    const all = this.connection.getConfigOptions();
+    if (!all) return [];
+    return all.filter((opt) => opt.category !== 'model' && opt.category !== 'mode');
+  }
 
-    return null;
+  /**
+   * Set a config option value on the ACP connection.
+   * Used for reasoning effort and other non-model config options.
+   */
+  async setConfigOption(configId: string, value: string): Promise<AcpSessionConfigOption[]> {
+    await this.connection.setConfigOption(configId, value);
+    return this.getConfigOptions();
   }
 
   /**
@@ -391,6 +423,9 @@ export class AcpAgent {
   private emitModelInfo(): void {
     const modelInfo = this.getModelInfo();
     if (modelInfo) {
+      if (this.extra.backend === 'codex') {
+        mainLog('[ACP codex]', 'Emitting model info', summarizeAcpModelInfo(modelInfo));
+      }
       this.onStreamEvent({
         type: 'acp_model_info',
         conversation_id: this.id,
@@ -746,6 +781,22 @@ export class AcpAgent {
 
   private handleSessionUpdate(data: AcpSessionUpdate): void {
     try {
+      if (data.update?.sessionUpdate === 'available_commands_update') {
+        const commandUpdate = data as AvailableCommandsUpdate;
+        const commands: AcpAvailableCommand[] = [];
+        for (const command of commandUpdate.update?.availableCommands || []) {
+          const name = command.name?.trim();
+          if (!name) continue;
+          const description = (command.description || command.name || '').trim();
+          commands.push({
+            name,
+            description: description || name,
+            hint: command.input?.hint?.trim(),
+          });
+        }
+        this.onAvailableCommandsUpdate?.(commands);
+      }
+
       // Intercept chrome-devtools navigation tools from session updates
       // 从会话更新中拦截 chrome-devtools 导航工具
       if (data.update?.sessionUpdate === 'tool_call') {
@@ -791,6 +842,22 @@ export class AcpAgent {
           // 清理跟踪
           this.pendingNavigationTools.delete(toolCallId);
         }
+      }
+
+      // Emit context usage data when usage_update arrives
+      if (data.update?.sessionUpdate === 'usage_update') {
+        this.hasReceivedUsageUpdate = true;
+        const usageUpdate = data.update as { used: number; size: number; cost?: { amount: number; currency: string } };
+        this.onStreamEvent({
+          type: 'acp_context_usage',
+          conversation_id: this.id,
+          msg_id: uuid(),
+          data: {
+            used: usageUpdate.used,
+            size: usageUpdate.size,
+            cost: usageUpdate.cost,
+          },
+        });
       }
 
       // Emit updated model info when config_option_update arrives
@@ -901,6 +968,30 @@ export class AcpAgent {
   }
 
   /**
+   * Handle PromptResponse.usage from ACP backend (codex-acp PR #167).
+   * Used as fallback context usage when usage_update notifications are not available.
+   * Follows the same pattern as Gemini CLI's usageMetadata extraction.
+   */
+  private handlePromptUsage(usage: AcpPromptResponseUsage): void {
+    // Skip if usage_update notifications are already providing context usage data
+    if (this.hasReceivedUsageUpdate) {
+      return;
+    }
+
+    // Use totalTokens from PromptResponse as context usage indicator (fallback)
+    // size=0 tells the frontend to use model-based context limit lookup
+    this.onStreamEvent({
+      type: 'acp_context_usage',
+      conversation_id: this.id,
+      msg_id: uuid(),
+      data: {
+        used: usage.totalTokens,
+        size: 0,
+      },
+    });
+  }
+
+  /**
    * Handle unexpected disconnect from ACP backend
    * Notify frontend and clean up internal state
    */
@@ -975,6 +1066,7 @@ export class AcpAgent {
       content: {
         backend: this.extra.backend,
         status,
+        agentName: this.extra.agentName,
       },
     };
 
@@ -1157,6 +1249,11 @@ export class AcpAgent {
   /**
    * Create a new session or resume an existing one, and notify upper layer if session ID changed.
    * 创建新会话或恢复现有会话，如果 session ID 变化则通知上层。
+   *
+   * Resume strategy per backend:
+   * - Codex:           uses dedicated ACP `session/load` method
+   * - Claude/CodeBuddy: uses `session/new` with `_meta.claudeCode.options.resume`
+   * - Others:          uses `session/new` with generic `resumeSessionId` param
    */
   private async createOrResumeSession(): Promise<void> {
     const resumeSessionId = this.extra.acpSessionId;
@@ -1166,10 +1263,21 @@ export class AcpAgent {
     // or the session simply expired. In that case, fall back to creating a fresh session.
     if (resumeSessionId) {
       try {
-        const response = await this.connection.newSession(this.extra.workspace, {
-          resumeSessionId,
-          forkSession: false,
-        });
+        let response: { sessionId?: string };
+
+        if (this.extra.backend === 'codex') {
+          // Codex ACP bridge implements session/load (load_session) which calls
+          // resume_thread_from_rollout internally to restore full conversation history.
+          // Codex ignores resumeSessionId in session/new, so we must use session/load.
+          response = await this.connection.loadSession(resumeSessionId, this.extra.workspace);
+        } else {
+          // Claude/CodeBuddy use _meta in session/new; others use generic resumeSessionId
+          response = await this.connection.newSession(this.extra.workspace, {
+            resumeSessionId,
+            forkSession: false,
+          });
+        }
+
         if (response.sessionId && response.sessionId !== resumeSessionId) {
           this.extra.acpSessionId = response.sessionId;
           this.onSessionIdUpdate?.(response.sessionId);

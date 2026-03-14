@@ -15,26 +15,24 @@ import ChannelTelegramLogo from '@/renderer/assets/channel-logos/telegram.svg';
 import { isElectronDesktop } from '@/renderer/utils/platform';
 import { Button, Form, Input, Message, Switch, Tabs, Tooltip } from '@arco-design/web-react';
 import { CheckOne, Communication, Copy, Earth, EditTwo, Refresh } from '@icon-park/react';
-import { QRCodeSVG } from 'qrcode.react';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSettingsViewMode } from '../settingsViewContext';
-import ChannelModalContent from './ChannelModalContent';
 
 /**
  * 偏好设置行组件
  * Preference row component
  */
 const PreferenceRow: React.FC<{ label: string; description?: React.ReactNode; extra?: React.ReactNode; children: React.ReactNode }> = ({ label, description, extra, children }) => (
-  <div className='flex items-center justify-between gap-24px py-12px'>
-    <div className='flex-1'>
+  <div className='flex items-center justify-between gap-12px py-12px'>
+    <div className='min-w-0 flex-1'>
       <div className='flex items-center gap-8px'>
         <span className='text-14px text-t-primary'>{label}</span>
         {extra}
       </div>
       {description && <div className='text-12px text-t-tertiary mt-2px'>{description}</div>}
     </div>
-    <div className='flex items-center'>{children}</div>
+    <div className='flex items-center shrink-0'>{children}</div>
   </div>
 );
 
@@ -45,6 +43,12 @@ const CHANNEL_LOGOS = [
   { src: ChannelSlackLogo, alt: 'Slack' },
   { src: ChannelDiscordLogo, alt: 'Discord' },
 ] as const;
+
+const ChannelModalContentLazy = React.lazy(() => import('./ChannelModalContent'));
+const QRCodeSVGLazy = React.lazy(async () => {
+  const mod = await import('qrcode.react');
+  return { default: mod.QRCodeSVG };
+});
 
 /**
  * WebUI 设置内容组件
@@ -520,7 +524,9 @@ const WebuiModalContent: React.FC = () => {
         <AionScrollArea className='flex-1 min-h-0 pb-16px' disableOverflow={isPageMode}>
           <div className='space-y-16px'>
             <h2 className='text-20px font-500 text-t-primary m-0'>Channels</h2>
-            <ChannelModalContent />
+            <Suspense fallback={<div className='text-13px text-t-secondary'>{t('common.loading')}</div>}>
+              <ChannelModalContentLazy />
+            </Suspense>
           </div>
         </AionScrollArea>
       </div>
@@ -579,8 +585,8 @@ const WebuiModalContent: React.FC = () => {
           {/* 访问地址（仅运行时显示）/ Access URL (only when running) */}
           {status?.running && (
             <PreferenceRow label={t('settings.webui.accessUrl')}>
-              <div className='flex items-center gap-8px'>
-                <button className='text-14px text-primary font-mono hover:underline cursor-pointer bg-transparent border-none p-0' onClick={() => shell.openExternal.invoke(getDisplayUrl()).catch(console.error)}>
+              <div className='flex items-center gap-8px min-w-0'>
+                <button className='text-14px text-primary font-mono hover:underline cursor-pointer bg-transparent border-none p-0 truncate' onClick={() => shell.openExternal.invoke(getDisplayUrl()).catch(console.error)}>
                   {getDisplayUrl()}
                 </button>
                 <Tooltip content={t('common.copy')}>
@@ -614,10 +620,10 @@ const WebuiModalContent: React.FC = () => {
           <div className='text-14px font-500 mb-8px text-t-primary'>{t('settings.webui.loginInfo')}</div>
 
           {/* 账号 / Account */}
-          <div className='flex items-center justify-between py-12px'>
-            <span className='text-14px text-t-secondary'>{t('settings.webui.username')}:</span>
-            <div className='inline-flex items-center gap-8px rd-100px border border-line bg-fill-1 px-10px py-4px whitespace-nowrap'>
-              <span className='text-14px text-t-primary'>{status?.adminUsername || 'admin'}</span>
+          <div className='flex items-center justify-between gap-12px py-12px'>
+            <span className='text-14px text-t-secondary shrink-0'>{t('settings.webui.username')}:</span>
+            <div className='inline-flex items-center gap-8px rd-100px border border-line bg-fill-1 px-10px py-4px min-w-0'>
+              <span className='text-14px text-t-primary truncate'>{status?.adminUsername || 'admin'}</span>
               <Tooltip content={t('common.copy')}>
                 <Button type='text' size='mini' className='rd-100px !px-6px inline-flex items-center !h-24px' onClick={() => handleCopy(status?.adminUsername || 'admin')}>
                   <Copy size={14} />
@@ -627,10 +633,10 @@ const WebuiModalContent: React.FC = () => {
           </div>
 
           {/* 密码 / Password */}
-          <div className='flex items-center justify-between py-12px'>
-            <span className='text-14px text-t-secondary'>{t('settings.webui.initialPassword')}:</span>
-            <div className='inline-flex items-center gap-8px rd-100px border border-line bg-fill-1 px-10px py-4px whitespace-nowrap'>
-              <span className='text-14px text-t-primary'>{displayPassword}</span>
+          <div className='flex items-center justify-between gap-12px py-12px'>
+            <span className='text-14px text-t-secondary shrink-0'>{t('settings.webui.initialPassword')}:</span>
+            <div className='inline-flex items-center gap-8px rd-100px border border-line bg-fill-1 px-10px py-4px min-w-0'>
+              <span className='text-14px text-t-primary truncate'>{displayPassword}</span>
               <Tooltip content={t('settings.webui.resetPasswordTooltip')}>
                 <Button type='text' size='mini' className='rd-100px !px-6px inline-flex items-center !h-24px' onClick={handleResetPassword} disabled={resetLoading}>
                   <EditTwo size={14} />
@@ -655,7 +661,15 @@ const WebuiModalContent: React.FC = () => {
                     </div>
                   ) : qrUrl ? (
                     <div className='p-8px bg-white rd-8px'>
-                      <QRCodeSVG value={qrUrl} size={140} level='M' />
+                      <Suspense
+                        fallback={
+                          <div className='w-140px h-140px flex items-center justify-center'>
+                            <span className='text-14px text-t-tertiary'>{t('common.loading')}</span>
+                          </div>
+                        }
+                      >
+                        <QRCodeSVGLazy value={qrUrl} size={140} level='M' />
+                      </Suspense>
                     </div>
                   ) : (
                     <div className='w-140px h-140px flex items-center justify-center'>
@@ -687,7 +701,7 @@ const WebuiModalContent: React.FC = () => {
         <Tabs.TabPane
           key='webui'
           title={
-            <span className={`inline-flex items-center gap-6px transition-colors ${activeTab === 'webui' ? 'text-t-primary font-600' : 'text-t-secondary'}`}>
+            <span data-webui-tab='webui' className={`inline-flex items-center gap-6px transition-colors ${activeTab === 'webui' ? 'text-t-primary font-600' : 'text-t-secondary'}`}>
               <Earth theme='outline' size='15' />
               <span>WebUI</span>
             </span>
@@ -696,7 +710,7 @@ const WebuiModalContent: React.FC = () => {
         <Tabs.TabPane
           key='channels'
           title={
-            <span className={`inline-flex items-center gap-6px transition-colors ${activeTab === 'channels' ? 'text-t-primary font-600' : 'text-t-secondary'}`}>
+            <span data-webui-tab='channels' className={`inline-flex items-center gap-6px transition-colors ${activeTab === 'channels' ? 'text-t-primary font-600' : 'text-t-secondary'}`}>
               <Communication theme='outline' size='15' />
               <span>Channels</span>
               <span className='inline-flex items-center gap-4px ml-2px'>
@@ -715,7 +729,9 @@ const WebuiModalContent: React.FC = () => {
         webuiPanel
       ) : (
         <div className='flex-1 min-h-0'>
-          <ChannelModalContent />
+          <Suspense fallback={<div className='px-[12px] md:px-[28px] text-13px text-t-secondary'>{t('common.loading')}</div>}>
+            <ChannelModalContentLazy />
+          </Suspense>
         </div>
       )}
 

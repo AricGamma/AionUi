@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import { getAgentModes, supportsModeSwitch, type AgentModeOption } from '@/renderer/constants/agentModes';
+import { useLayoutContext } from '@/renderer/context/LayoutContext';
 import { iconColors } from '@/renderer/theme/colors';
 import { getAgentLogo } from '@/renderer/utils/agentLogo';
 import { Button, Dropdown, Menu, Message } from '@arco-design/web-react';
@@ -26,10 +27,24 @@ export interface AgentModeSelectorProps {
   conversationId?: string;
   /** Compact mode: only show mode label + dropdown, no logo/name / 紧凑模式：仅显示模式标签和下拉 */
   compact?: boolean;
+  /** Show agent logo in compact mode / 紧凑模式是否显示代理图标 */
+  showLogoInCompact?: boolean;
+  /** Compact label content: mode label or agent name / 紧凑模式文案：模式名或代理名 */
+  compactLabelType?: 'mode' | 'agent';
   /** Initial mode override (for Guid page pre-conversation selection) */
   initialMode?: string;
   /** Callback when mode is selected locally (no conversationId needed) */
   onModeSelect?: (mode: string) => void;
+  /** Optional compact label override */
+  compactLabelOverride?: string;
+  /** Optional compact leading icon */
+  compactLeadingIcon?: React.ReactNode;
+  /** Optional display label formatter for mode options */
+  modeLabelFormatter?: (mode: AgentModeOption) => string;
+  /** Optional compact prefix text, e.g. "Permission" / "权限" */
+  compactLabelPrefix?: string;
+  /** Hide compact prefix on mobile */
+  hideCompactLabelPrefixOnMobile?: boolean;
 }
 
 /**
@@ -39,8 +54,10 @@ export interface AgentModeSelectorProps {
  * 代理模式选择器 - 用于切换代理模式的下拉组件
  * 显示代理 logo 和名称，通过下拉菜单选择模式
  */
-const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentName, agentLogo, agentLogoIsEmoji, conversationId, compact, initialMode, onModeSelect }) => {
+const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentName, agentLogo, agentLogoIsEmoji, conversationId, compact, showLogoInCompact = false, compactLabelType = 'mode', initialMode, onModeSelect, compactLabelOverride, compactLeadingIcon, modeLabelFormatter, compactLabelPrefix, hideCompactLabelPrefixOnMobile = false }) => {
   const { t } = useTranslation();
+  const layout = useLayoutContext();
+  const isMobile = Boolean(layout?.isMobile);
   const modes = getAgentModes(backend);
   const defaultMode = modes[0]?.value ?? 'default';
   // Validate initialMode against available modes; fall back to backend's default
@@ -49,8 +66,11 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentNam
   const [currentMode, setCurrentMode] = useState<string>(validInitialMode);
   const [isLoading, setIsLoading] = useState(false);
   const [dropdownVisible, setDropdownVisible] = useState(false);
+  const getDisplayModeLabel = useCallback((mode: AgentModeOption) => modeLabelFormatter?.(mode) ?? mode.label, [modeLabelFormatter]);
 
   const canSwitchMode = supportsModeSwitch(backend) && (conversationId || onModeSelect);
+  // Mobile conversation header agent pill is display-only by design.
+  const canInteract = canSwitchMode && !(compact && compactLabelType === 'agent');
 
   // When initialMode prop changes (e.g. agent switch on Guid page), update local state.
   // Validate against available modes to handle backends with non-standard default
@@ -131,23 +151,27 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentNam
 
   // Render logo based on source
   const renderLogo = () => {
-    if (agentLogo) {
-      if (agentLogoIsEmoji) {
-        return <span className='text-sm'>{agentLogo}</span>;
+    const logoContent = (() => {
+      if (agentLogo) {
+        if (agentLogoIsEmoji) {
+          return <span className='text-14px leading-none'>{agentLogo}</span>;
+        }
+        return <img src={agentLogo} alt={`${agentName || 'agent'} logo`} className='block w-16px h-16px object-contain' />;
       }
-      return <img src={agentLogo} alt={`${agentName || 'agent'} logo`} width={16} height={16} style={{ objectFit: 'contain' }} />;
-    }
-    const logo = getAgentLogo(backend);
-    if (logo) {
-      return <img src={logo} alt={`${backend} logo`} width={16} height={16} style={{ objectFit: 'contain' }} />;
-    }
-    return <Robot theme='outline' size={16} fill={iconColors.primary} />;
+      const logo = getAgentLogo(backend);
+      if (logo) {
+        return <img src={logo} alt={`${backend} logo`} className='block w-16px h-16px object-contain' />;
+      }
+      return <Robot theme='outline' size={16} fill={iconColors.primary} />;
+    })();
+
+    return <span className='inline-flex w-16px h-16px items-center justify-center shrink-0 leading-none'>{logoContent}</span>;
   };
 
   // Get display label for current mode
   const getCurrentModeLabel = () => {
     const modeOption = modes.find((m) => m.value === currentMode);
-    return modeOption?.label ?? '';
+    return modeOption ? getDisplayModeLabel(modeOption) : '';
   };
 
   // Dropdown menu (shared between compact and full mode)
@@ -158,7 +182,7 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentNam
           <Menu.Item key={mode.value} className={currentMode === mode.value ? '!bg-2' : ''}>
             <div className='flex items-center gap-8px'>
               {currentMode === mode.value && <span className='text-primary'>✓</span>}
-              <span className={currentMode !== mode.value ? 'ml-16px' : ''}>{mode.label}</span>
+              <span className={currentMode !== mode.value ? 'ml-16px' : ''}>{getDisplayModeLabel(mode)}</span>
             </div>
           </Menu.Item>
         ))}
@@ -168,13 +192,37 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({ backend, agentNam
 
   // Compact mode: render only mode label chip in sendbox area
   if (compact) {
-    if (!canSwitchMode) return null;
+    const legacyCompactBehavior = !showLogoInCompact && compactLabelType === 'mode';
+    const baseCompactLabel = compactLabelType === 'agent' ? agentName || backend || 'Agent' : canSwitchMode ? getCurrentModeLabel() : agentName || backend || 'Agent';
+    const compactLabel = compactLabelOverride || (compactLabelPrefix && compactLabelType !== 'agent' ? (hideCompactLabelPrefixOnMobile && isMobile ? baseCompactLabel : `${compactLabelPrefix} · ${baseCompactLabel}`) : baseCompactLabel);
+    if (!canInteract && legacyCompactBehavior) {
+      return null;
+    }
 
     const compactContent = (
-      <Button className='sendbox-model-btn' shape='round' style={{ opacity: isLoading ? 0.6 : 1, transition: 'opacity 0.2s' }}>
-        <span>{getCurrentModeLabel()}</span>
+      <Button
+        className={`sendbox-model-btn agent-mode-compact-pill ${canInteract ? '' : 'agent-mode-compact-pill--readonly'}`}
+        shape='round'
+        size='small'
+        onClick={canInteract ? () => !isLoading && setDropdownVisible((visible) => !visible) : undefined}
+        style={{
+          opacity: isLoading ? 0.6 : 1,
+          transition: 'opacity 0.2s',
+          cursor: canInteract ? 'pointer' : 'default',
+        }}
+      >
+        <span className='flex items-center gap-6px min-w-0 leading-none'>
+          {compactLeadingIcon && <span className='shrink-0 inline-flex items-center'>{compactLeadingIcon}</span>}
+          {showLogoInCompact && <span className='shrink-0 inline-flex items-center'>{renderLogo()}</span>}
+          <span className='block truncate leading-none'>{compactLabel}</span>
+          {canInteract && <Down size={12} className='text-t-tertiary shrink-0' />}
+        </span>
       </Button>
     );
+
+    if (!canInteract) {
+      return compactContent;
+    }
 
     return (
       <Dropdown trigger='click' popupVisible={dropdownVisible} onVisibleChange={(visible) => !isLoading && setDropdownVisible(visible)} droplist={dropdownMenu}>

@@ -27,18 +27,35 @@ const DMG_RETRY_DELAY_SEC = 30;
 // Incremental build: hash of source files to detect changes
 const INCREMENTAL_CACHE_FILE = 'out/.build-hash';
 
+function walkFiles(dir, acc = []) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name === 'out' || entry.name === '.git') continue;
+      walkFiles(fullPath, acc);
+    } else if (entry.isFile()) {
+      acc.push(fullPath);
+    }
+  }
+  return acc;
+}
+
 function computeSourceHash() {
   const hash = crypto.createHash('md5');
+  const rootDir = path.resolve(__dirname, '..');
   const filesToHash = [
     'package.json',
     'package-lock.json',
+    'bun.lock',
     'tsconfig.json',
     'electron.vite.config.ts',
     'electron-builder.yml',
+    'justfile',
   ];
 
   for (const file of filesToHash) {
-    const filePath = path.resolve(__dirname, '..', file);
+    const filePath = path.resolve(rootDir, file);
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath);
       hash.update(file + ':');
@@ -46,13 +63,21 @@ function computeSourceHash() {
     }
   }
 
-  // Add key src directories modification times
-  const srcDirs = ['src', 'public'];
-  for (const dir of srcDirs) {
-    const dirPath = path.resolve(__dirname, '..', dir);
-    if (fs.existsSync(dirPath)) {
-      const stat = fs.statSync(dirPath);
-      hash.update(dir + ':' + stat.mtimeMs);
+  const hashDirs = ['src', 'public', 'scripts'];
+  for (const dir of hashDirs) {
+    const dirPath = path.resolve(rootDir, dir);
+    if (!fs.existsSync(dirPath)) continue;
+
+    const files = walkFiles(dirPath)
+      .map((file) => path.relative(rootDir, file).replace(/\\/g, '/'))
+      .sort();
+
+    for (const relPath of files) {
+      const absolutePath = path.resolve(rootDir, relPath);
+      const stat = fs.statSync(absolutePath);
+      hash.update(relPath + ':');
+      hash.update(String(stat.size));
+      hash.update(String(stat.mtimeMs));
     }
   }
 
@@ -144,6 +169,44 @@ function dmgExists(outDir) {
   }
 }
 
+function tryRemoveDir(targetDir) {
+  if (!fs.existsSync(targetDir)) return true;
+  try {
+    fs.rmSync(targetDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    return true;
+  } catch (error) {
+    console.log(`❌ Failed to remove ${targetDir}: ${error.message}`);
+    return false;
+  }
+}
+
+function isProcessRunningWindows(imageName) {
+  if (process.platform !== 'win32') return false;
+  try {
+    const result = execSync(`tasklist /FI "IMAGENAME eq ${imageName}"`, { stdio: ['ignore', 'pipe', 'ignore'] });
+    return result.toString().toLowerCase().includes(imageName.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function killWindowsProcesses(imageNames) {
+  if (process.platform !== 'win32') return;
+  for (const name of imageNames) {
+    try {
+      execSync(`taskkill /F /IM ${name}`, { stdio: 'ignore' });
+    } catch {
+    }
+  }
+}
+
+function formatExecError(error) {
+  return [error?.message, error?.stdout?.toString?.(), error?.stderr?.toString?.()]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
 // Create DMG using electron-builder --prepackaged with .app path
 // This preserves DMG styling from electron-builder.yml (window size, icon positions, background)
 function createDmgWithPrepackaged(appDir, targetArch) {
@@ -191,6 +254,35 @@ function buildWithDmgRetry(cmd, targetArch) {
         }
       }
     }
+  }
+}
+
+// Clean stale Windows packaging outputs from previous runs
+function cleanupWindowsPackOutput() {
+  const outDir = path.resolve(__dirname, '../out');
+  if (!fs.existsSync(outDir)) return;
+
+  const removed = [];
+  const winUnpackedDirRe = /^win(?:-[a-z0-9]+)?-unpacked$/i;
+  const winArtifactFileRe = /-win-[^.]+\.(?:exe|msi|zip|7z|blockmap)$/i;
+
+  for (const entry of fs.readdirSync(outDir, { withFileTypes: true })) {
+    const fullPath = path.join(outDir, entry.name);
+
+    if (entry.isDirectory() && winUnpackedDirRe.test(entry.name)) {
+      fs.rmSync(fullPath, { recursive: true, force: true });
+      removed.push(entry.name);
+      continue;
+    }
+
+    if (entry.isFile() && winArtifactFileRe.test(entry.name)) {
+      fs.rmSync(fullPath, { force: true });
+      removed.push(entry.name);
+    }
+  }
+
+  if (removed.length > 0) {
+    console.log(`🧹 Cleaned stale Windows outputs: ${removed.join(', ')}`);
   }
 }
 
@@ -368,7 +460,93 @@ try {
     console.log(`🚀 Creating distributables for ${targetArch}...`);
   }
 
-  buildWithDmgRetry(`bunx electron-builder ${builderArgs} ${archFlag} ${publishArg}`, targetArch);
+  // 为 Windows 构建添加架构检测脚本
+  // Add architecture detection scripts for Windows builds
+  // 使用 .onVerifyInstDir 避免与 electron-builder 冲突
+  // Use .onVerifyInstDir to avoid conflicts with electron-builder
+  let nsisInclude = '';
+  if (builderArgs.includes('--win') || builderArgs.includes('--all')) {
+    if (!multiArch) {
+      // 单架构构建：添加对应架构的检测脚本
+      // Single-arch build: Add architecture-specific detection script
+      if (targetArch === 'arm64') {
+        const arm64Script = 'resources/windows-installer-arm64.nsh';
+        if (fs.existsSync(path.resolve(__dirname, '..', arm64Script))) {
+          nsisInclude += ` --config.nsis.include="${arm64Script}"`;
+          console.log(`📋 Including Windows ARM64 architecture check script`);
+        }
+      } else if (targetArch === 'x64') {
+        const x64Script = 'resources/windows-installer-x64.nsh';
+        if (fs.existsSync(path.resolve(__dirname, '..', x64Script))) {
+          nsisInclude += ` --config.nsis.include="${x64Script}"`;
+          console.log(`📋 Including Windows x64 architecture check script`);
+        }
+      }
+    }
+    // 多架构构建：暂不支持架构检测脚本
+    // Multi-arch builds: Architecture detection not supported yet
+  }
+
+  if (process.platform === 'win32' && builderArgs.includes('--win')) {
+    const winUnpackedDir = path.join(outDir, 'win-unpacked');
+    let cleaned = tryRemoveDir(winUnpackedDir);
+    if (!cleaned) {
+      const aionRunning = isProcessRunningWindows('AionUi.exe');
+      const electronRunning = isProcessRunningWindows('electron.exe');
+      if (aionRunning || electronRunning) {
+        console.log('⚠️  Detected running AionUi/Electron process. Attempting to close...');
+        killWindowsProcesses(['AionUi.exe', 'electron.exe']);
+        cleaned = tryRemoveDir(winUnpackedDir);
+        if (!cleaned) {
+          console.log('⚠️  Directory still locked. Please close any running AionUi/Electron processes and retry.');
+        }
+      }
+    }
+  }
+
+  const isWindowsBuild = builderArgs.includes('--win') || builderArgs.includes('--all');
+  if (isWindowsBuild) {
+    cleanupWindowsPackOutput();
+  }
+
+  const builderCommand = `bunx electron-builder ${builderArgs} ${archFlag} ${nsisInclude} ${publishArg}`;
+  try {
+    buildWithDmgRetry(builderCommand, targetArch);
+  } catch (error) {
+    const winExePath = path.join(outDir, 'win-unpacked', 'AionUi.exe');
+    const firstError = formatExecError(error);
+    const canRetryWithoutExecutableEdit = process.platform === 'win32'
+      && isWindowsBuild
+      && process.env.CI !== 'true'
+      && fs.existsSync(winExePath);
+
+    if (!canRetryWithoutExecutableEdit) {
+      throw error;
+    }
+
+    console.log('⚠️  Windows local build failed after AionUi.exe was produced.');
+    if (firstError) {
+      console.log('   First failure summary:');
+      console.log(firstError.split(/\r?\n/).slice(0, 6).map((line) => `   ${line}`).join('\n'));
+    }
+    console.log('   Retrying local build with win.signAndEditExecutable=false...');
+    console.log('   This fallback is intended for transient rcedit / file-lock failures on developer machines.');
+    killWindowsProcesses(['AionUi.exe', 'electron.exe']);
+    cleanupWindowsPackOutput();
+
+    try {
+      buildWithDmgRetry(`${builderCommand} --config.win.signAndEditExecutable=false`, targetArch);
+    } catch (retryError) {
+      const retryFailure = formatExecError(retryError);
+      throw new Error([
+        'Windows local retry with win.signAndEditExecutable=false also failed.',
+        'First failure:',
+        firstError || String(error),
+        'Retry failure:',
+        retryFailure || String(retryError),
+      ].join('\n'));
+    }
+  }
 
   console.log('✅ Build completed!');
 } catch (error) {

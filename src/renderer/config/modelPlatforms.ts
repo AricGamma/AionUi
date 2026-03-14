@@ -35,6 +35,7 @@ import CtyunLogo from '@/renderer/assets/logos/ctyun.svg';
 import StepFunLogo from '@/renderer/assets/logos/stepfun.svg';
 import MiniMaxLogo from '@/renderer/assets/logos/minimax.png';
 import NewApiLogo from '@/renderer/assets/logos/newapi.svg';
+import PPIOLogo from '@/renderer/assets/logos/ppio.svg';
 
 /**
  * 平台类型
@@ -90,6 +91,7 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
   { name: 'MiniMax', value: 'MiniMax', logo: MiniMaxLogo, platform: 'custom', baseUrl: 'https://api.minimaxi.com/v1' },
   { name: 'OpenRouter', value: 'OpenRouter', logo: OpenRouterLogo, platform: 'custom', baseUrl: 'https://openrouter.ai/api/v1' },
   { name: 'Dashscope', value: 'Dashscope', logo: QwenLogo, platform: 'custom', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  { name: 'Dashscope Coding Plan', value: 'Dashscope-Coding', logo: QwenLogo, platform: 'custom', baseUrl: 'https://coding.dashscope.aliyuncs.com/v1' },
   { name: 'SiliconFlow-CN', value: 'SiliconFlow-CN', logo: SiliconFlowLogo, platform: 'custom', baseUrl: 'https://api.siliconflow.cn/v1' },
   { name: 'SiliconFlow', value: 'SiliconFlow', logo: SiliconFlowLogo, platform: 'custom', baseUrl: 'https://api.siliconflow.com/v1' },
   { name: 'Zhipu', value: 'Zhipu', logo: ZhipuLogo, platform: 'custom', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
@@ -101,6 +103,7 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
   { name: 'Hunyuan', value: 'Hunyuan', logo: TencentLogo, platform: 'custom', baseUrl: 'https://api.hunyuan.cloud.tencent.com/v1' },
   { name: 'Lingyi', value: 'Lingyi', logo: LingyiLogo, platform: 'custom', baseUrl: 'https://api.lingyiwanwu.com/v1' },
   { name: 'Poe', value: 'Poe', logo: PoeLogo, platform: 'custom', baseUrl: 'https://api.poe.com/v1' },
+  { name: 'PPIO', value: 'PPIO', logo: PPIOLogo, platform: 'custom', baseUrl: 'https://api.ppinfra.com/v3/openai' },
   { name: 'ModelScope', value: 'ModelScope', logo: ModelScopeLogo, platform: 'custom', baseUrl: 'https://api-inference.modelscope.cn/v1' },
   { name: 'InfiniAI', value: 'InfiniAI', logo: InfiniAILogo, platform: 'custom', baseUrl: 'https://cloud.infini-ai.com/maas/v1' },
   { name: 'Ctyun', value: 'Ctyun', logo: CtyunLogo, platform: 'custom', baseUrl: 'https://wishub-x1.ctyun.cn/v1' },
@@ -116,6 +119,18 @@ export const NEW_API_PROTOCOL_OPTIONS = [
   { label: 'Gemini', value: 'gemini' },
   { label: 'Anthropic', value: 'anthropic' },
 ];
+
+/**
+ * 根据模型名称自动推断 New API 协议类型
+ * Auto-detect New API protocol type based on model name
+ */
+export const detectNewApiProtocol = (modelName: string): string => {
+  const name = modelName.toLowerCase();
+  if (name.startsWith('claude') || name.startsWith('anthropic')) return 'anthropic';
+  if (name.startsWith('gemini') || name.startsWith('models/gemini')) return 'gemini';
+  // Default to openai (covers gpt, deepseek, qwen, o1, o3, etc.)
+  return 'openai';
+};
 
 // ============ 工具函数 / Utility Functions ============
 

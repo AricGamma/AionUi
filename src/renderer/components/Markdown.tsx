@@ -9,6 +9,7 @@ import ReactMarkdown from 'react-markdown';
 import SyntaxHighlighter from 'react-syntax-highlighter';
 import { vs, vs2015 } from 'react-syntax-highlighter/dist/esm/styles/hljs';
 import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -17,8 +18,9 @@ import katex from 'katex';
 // Import KaTeX CSS to make it available in the document
 import 'katex/dist/katex.min.css';
 
-import { ipcBridge } from '@/common';
 import { diffColors } from '@/renderer/theme/colors';
+import { copyText } from '@/renderer/utils/clipboard';
+import { openExternalUrl } from '@/renderer/utils/platform';
 import { Message } from '@arco-design/web-react';
 import { Copy, Down, Up } from '@icon-park/react';
 import { theme } from '@office-ai/platform';
@@ -173,9 +175,13 @@ function CodeBlock(props: any) {
                 style={{ cursor: 'pointer' }}
                 fill='var(--text-secondary)'
                 onClick={() => {
-                  void navigator.clipboard.writeText(formatCode(children)).then(() => {
-                    Message.success(t('common.copySuccess'));
-                  });
+                  void copyText(formatCode(children))
+                    .then(() => {
+                      Message.success(t('common.copySuccess'));
+                    })
+                    .catch(() => {
+                      Message.error(t('common.copyFailed'));
+                    });
                 }}
               />
               {/* 折叠/展开按钮 / Fold/unfold button */}
@@ -264,6 +270,7 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
     word-break: break-word;
     overflow-wrap: anywhere;
     color: var(--text-primary);
+    max-width: 100%;
   }
   .markdown-shadow-body>p:first-child
   {
@@ -299,8 +306,12 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
   .markdown-shadow-body>p:last-child{
     margin-bottom:0px;
   }
-  ol {
+  ol, ul {
     padding-inline-start:20px;
+  }
+  pre {
+    max-width: 100%;
+    overflow-x: auto;
   }
   img {
     max-width: 100%;
@@ -525,9 +536,11 @@ interface MarkdownViewProps {
   codeStyle?: React.CSSProperties;
   className?: string;
   onRef?: (el?: HTMLDivElement | null) => void;
+  /** Enable raw HTML rendering in markdown content. Use with caution — only for trusted sources. */
+  allowHtml?: boolean;
 }
 
-const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeStyle, className, onRef, children: childrenProp }) => {
+const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeStyle, className, onRef, allowHtml, children: childrenProp }) => {
   const { t } = useTranslation();
 
   const normalizedChildren = useMemo(() => {
@@ -555,7 +568,7 @@ const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeS
         <div ref={onRef} className='markdown-shadow-body'>
           <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-            rehypePlugins={[rehypeKatex]}
+            rehypePlugins={allowHtml ? [rehypeRaw, rehypeKatex] : [rehypeKatex]}
             components={{
               span: ({ node: _node, className, children, ...props }) => {
                 return (
@@ -574,13 +587,9 @@ const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeS
                     e.preventDefault();
                     e.stopPropagation();
                     if (!props.href) return;
-                    try {
-                      ipcBridge.shell.openExternal.invoke(props.href).catch((error) => {
-                        console.error(t('messages.openLinkFailed'), error);
-                      });
-                    } catch (error) {
+                    openExternalUrl(props.href).catch((error) => {
                       console.error(t('messages.openLinkFailed'), error);
-                    }
+                    });
                   }}
                 />
               ),
